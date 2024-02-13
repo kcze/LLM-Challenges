@@ -3,7 +3,13 @@ from llm import llm
 def main():
 
     print("Starting the conversation. Type 'quit' to exit.")
-    chat_helper = llm()
+
+    api_key = ""
+    # I didn't want to just put the API key in the code for security reasons
+    # So I made the .api file and added it in the .gitignore
+    with open(".api", "r") as file:
+        api_key = file.read()
+    chat_helper = llm(api_key)
 
     while True:
         user_input = input("\n\033[92mYou:\033[0m ")

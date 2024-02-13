@@ -1,12 +1,13 @@
 from openai import OpenAI
 
 class llm:
-    def __init__(self):
+    # I added the api param, I'm aware that this could break other's people code so I made it optional
+    def __init__(self, api: str = ""):
         self.full_message_history = [] # This is the full conversation history https://platform.openai.com/docs/api-reference/chat/object . 
-        self.client = OpenAI(api_key='') # <== Put API key provided in the challenge email here.
+        self.client = OpenAI(api_key=api) # <== Put API key provided in the challenge email here.
         self.DEBUG = False # Set this to True to see the context window being sent to the LLM.
         if self.client.api_key == '':
-            raise ValueError("\033[91m Please enter the OpenAI API key which was provided in the challenge email into llm.py.\033[0m")
+            raise ValueError("\033[91m Please enter the OpenAI API key which was provided in the challenge email into llm constructor.\033[0m")
 
     def manage_context_window(self):
         """
