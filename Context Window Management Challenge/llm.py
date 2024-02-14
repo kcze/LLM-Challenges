@@ -1,11 +1,37 @@
 from openai import OpenAI
+import tiktoken
 
+class Message:
+    # Static tokenizer to count the number of tokens
+    tokenizer = tiktoken.encoding_for_model("gpt-4")
+
+    def __init__(self, role: str, content: str):
+        self.role = role
+        self.content = content
+        #NOTE it would be good to reconsider the choice of putting mutable is_summarized variable
+        self.is_summarized = False # Whether the message has been summarized and added to the memories
+        self.token_count = len(Message.tokenizer.encode(content)) # the number of tokens in the message
+
+    def get(self) -> dict[str, str]:
+        """
+        Returns the message as a dictionary in OpenAI format.
+
+        Returns:
+            {"role": str, "content": str}
+        """
+        return {"role": self.role, "content": self.content}
+
+# Memory management: summarization
 class llm:
     # I added the api param, I'm aware that this could break other's people code so I made it optional
     def __init__(self, api: str = ""):
         self.full_message_history = [] # This is the full conversation history https://platform.openai.com/docs/api-reference/chat/object . 
-        self.client = OpenAI(api_key=api) # <== Put API key provided in the challenge email here.
-        self.DEBUG = False # Set this to True to see the context window being sent to the LLM.
+        self.memory = ""
+        self.client = OpenAI(api_key=api)
+        self.DEBUG = True # Set this to True to see the context window being sent to the LLM.
+        self.max_message_tokens = 128 # The maximum number of tokens for messages in the context, excluding memory
+        # Overflowing messages will be summarized and added to the memory
+        self.max_memory_tokens = 128 # The maximum number of tokens for the memory
         if self.client.api_key == '':
             raise ValueError("\033[91m Please enter the OpenAI API key which was provided in the challenge email into llm constructor.\033[0m")
 
@@ -17,7 +43,79 @@ class llm:
         Returns:
             list: The context window to be sent to the LLM.
         """
-        return self.full_message_history[-4:]  # Very primitive context window management, truncating the message history to the last 4 messages and losing all prior context.
+        context = []
+        # First add messages from the full history from the newest to the context till the max_message_tokens is reached
+        message_tokens = 0
+        last_index = 0  # To keep track of where we left off
+
+        # Iterate over the messages in reversed order
+        for index, message in enumerate(reversed(self.full_message_history)):
+            message_tokens += message.token_count
+            if message_tokens > self.max_message_tokens:
+                message_tokens -= message.token_count
+                last_index = len(self.full_message_history) - 1 - index
+                break
+            context.insert(0, message.get())
+        print(f"# Message tokens: {message_tokens}")
+
+        # Summarize the rest of unsummarized messages
+        # Need to iterate from the beginning so the messages are summarized in the correct order
+        to_summarize = []
+        for message in self.full_message_history[:last_index]:
+            if not message.is_summarized:
+                to_summarize.append(message)
+
+        if len(to_summarize) > 0:
+            self.memory = self.summarize(self.memory, to_summarize)
+
+        # Add the memory to the beginning of the context
+        if len(self.memory) > 0:
+            print(f"# Memory tokens: {len(Message.tokenizer.encode(self.memory))}")
+            print(f"{self.memory}")
+            print("#################")
+            context.insert(0, {"role": "system", "content": self.memory})
+                
+        return context
+
+    def summarize(self, memory: str, new_messages: list[Message]) -> str:
+        all_messages = ""
+        for message in new_messages:
+            all_messages += f"[{message.role}] {message.content}\n"
+            message.is_summarized = True
+
+        # Summarize the messages
+        # Using research-based "expert", "please", "important for my carrer", not using negatives
+        # Could be extended using chain-of-thought and think before summarizing
+        # The most important is beginning and end.
+        messages = [
+            {"role": "system", "content": """You are an expert summarizer.
+            Please summarize the following messages into a single message, this is important for my career.
+            Minimise the length of the summary but keep all the important information.
+            You are a helpful assistant so please include all important details about the user and main points of the conversation.
+            You are provided the current summary and the new messages.
+            Respond with the summary only."""},
+            {"role": "user", "content": f"{self.memory} + {all_messages}"},
+        ]
+
+        for i in range(3):
+            summary = self.gpt4_conversation(messages).choices[0].message.content
+            tokens = Message.tokenizer.encode(summary)
+            # If summary is short enough, break
+            if len(tokens) <= self.max_memory_tokens:
+                break
+            else:
+                # Otherwise, regenerate
+                print(f"!!! Summary too long: {len(tokens)} tokens")
+                messages.append({"role": "assistant", "content": summary})
+                messages.append({"role": "user", "content": "The summary is too long, please try again and make it shorter."})
+                # If it's still too long after 3 tries, truncate it
+                # That isn't good but better than regenerating indefinitely
+                if i == 2:
+                    summary = Message.tokenizer.decode(tokens[:self.max_memory_tokens])
+                    print(f"!!! Summary cut off: {summary} tokens")
+                    break
+            
+        return summary
 
     def send_message(self, prompt: str, role: str = 'user', json_response: bool = False):
         """
@@ -48,11 +146,14 @@ class llm:
             "Sure, I can help you with that!"
         """
         if role == 'user':
-            self.full_message_history.append({'role': 'user', 'content': prompt})
+            # self.full_message_history.append({'role': 'user', 'content': prompt})
+            self.full_message_history.append(Message('user', prompt))
         elif role == 'assistant':
-            self.full_message_history.append({'role': 'assistant', 'content': prompt})
+            # self.full_message_history.append({'role': 'assistant', 'content': prompt})
+            self.full_message_history.append(Message('assistant', prompt))
         elif role == 'system':
-            self.full_message_history.append({'role': 'system', 'content': prompt})
+            # self.full_message_history.append({'role': 'system', 'content': prompt})
+            self.full_message_history.append(Message('system', prompt))
         else:
             raise ValueError("Invalid role provided. Valid roles are 'user', 'assistant', or 'system'.")
 
@@ -66,7 +167,7 @@ class llm:
 
         ai_message = response.choices[0].message.content
 
-        self.full_message_history.append({'role': 'assistant', 'content': ai_message})
+        self.full_message_history.append(Message('assistant', ai_message))
         return ai_message
 
     #~#~#~# Methods for interacting with OpenAI's Chat Completions EndPoint #~#~#~#
@@ -114,52 +215,52 @@ class llm:
 
         return response
 
-    
-def gpt4_one_shot(self, system_prompt: str, user_prompt: str, json_response: bool = False, model: str = "gpt-4-1106-preview"):
-    """
-    Executes a one-shot completion with the GPT-4 language model, using both a system and a user prompt.
+    #NOTE this was outside of the class!!!
+    def gpt4_one_shot(self, system_prompt: str, user_prompt: str, json_response: bool = False, model: str = "gpt-4-1106-preview"):
+        """
+        Executes a one-shot completion with the GPT-4 language model, using both a system and a user prompt.
 
-    This method is designed for scenarios where a single interaction with the GPT-4 model is required, rather than a 
-    continuous conversation. It allows specifying both a system-level and a user-level prompt to guide the model's response.
+        This method is designed for scenarios where a single interaction with the GPT-4 model is required, rather than a 
+        continuous conversation. It allows specifying both a system-level and a user-level prompt to guide the model's response.
 
-    Args:
-        system_prompt (str): The system-level prompt that sets the context or instructions for the model.
-        user_prompt (str): The user's input or question to the model.
-        json_response (bool, optional): If True, forces the response to be in JSON format. Requires a defined response schema.
-                                        Defaults to False.
-        model (str, optional): The specific GPT-4 model version to be used for the completion. Defaults to "gpt-4-1106-preview".
+        Args:
+            system_prompt (str): The system-level prompt that sets the context or instructions for the model.
+            user_prompt (str): The user's input or question to the model.
+            json_response (bool, optional): If True, forces the response to be in JSON format. Requires a defined response schema.
+                                            Defaults to False.
+            model (str, optional): The specific GPT-4 model version to be used for the completion. Defaults to "gpt-4-1106-preview".
 
-    Returns:
-        str: The content of the model's response message as a string.
+        Returns:
+            str: The content of the model's response message as a string.
 
-    Raises:
-        ValueError: If the combined token count of the response and prompts exceeds the 4096 token limit.
+        Raises:
+            ValueError: If the combined token count of the response and prompts exceeds the 4096 token limit.
 
-    Note:
-        - The 'temperature' parameter influences the model's creativity and unpredictability.
-        - The 'max_tokens' parameter sets a limit on the response size.
-        - This method is suitable for tasks like generating content, answering questions, or other one-off tasks.
-    
-    Example:
-        >>> response = gpt4_one_shot("Always respond in French.", "Tell a one scentence poem about a robot's adventure.")
-        >>> print(response)
-        "Un robot solitaire, vers les étoiles il vole, son aventure commence, un rêve qui se dévoile."
-    """
-    # Initialize a one-shot completion with the GPT-4 model
-    response = self.client.chat.completions.create(
-        model=model,  # Specifies the GPT-4 model version
-        temperature=0.79,  # Sets the AI's creativity level
-        max_tokens=4096,  # Limits the response token count
-        response_format={"type": "json_object"} if json_response else None,  # Optional JSON response format
-        messages=[
-            {"role": "system", "content": system_prompt},  # System-level context or instruction
-            {"role": "user", "content": user_prompt}  # User input or question
-        ]
-    )
+        Note:
+            - The 'temperature' parameter influences the model's creativity and unpredictability.
+            - The 'max_tokens' parameter sets a limit on the response size.
+            - This method is suitable for tasks like generating content, answering questions, or other one-off tasks.
+        
+        Example:
+            >>> response = gpt4_one_shot("Always respond in French.", "Tell a one scentence poem about a robot's adventure.")
+            >>> print(response)
+            "Un robot solitaire, vers les étoiles il vole, son aventure commence, un rêve qui se dévoile."
+        """
+        # Initialize a one-shot completion with the GPT-4 model
+        response = self.client.chat.completions.create(
+            model=model,  # Specifies the GPT-4 model version
+            temperature=0.79,  # Sets the AI's creativity level
+            max_tokens=4096,  # Limits the response token count
+            response_format={"type": "json_object"} if json_response else None,  # Optional JSON response format
+            messages=[
+                {"role": "system", "content": system_prompt},  # System-level context or instruction
+                {"role": "user", "content": user_prompt}  # User input or question
+            ]
+        )
 
-    # Check if the total token usage exceeds the limit
-    # DO NOT CHANGE THIS - This is a requirement for the challenge.
-    if response.usage.total_tokens > 4096:
-        raise ValueError("CHALLENGE CONTEXT WINDOW EXCEEDED: The context window now exceeds the 4096 token limit. Please try again with a shorter prompt.")
+        # Check if the total token usage exceeds the limit
+        # DO NOT CHANGE THIS - This is a requirement for the challenge.
+        if response.usage.total_tokens > 4096:
+            raise ValueError("CHALLENGE CONTEXT WINDOW EXCEEDED: The context window now exceeds the 4096 token limit. Please try again with a shorter prompt.")
 
-    return response.choices[0].message.content
+        return response.choices[0].message.content
